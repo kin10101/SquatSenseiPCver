@@ -1,4 +1,6 @@
 import os
+from threading import Thread
+
 import cv2
 import mediapipe as mp
 import pickle
@@ -17,6 +19,7 @@ current_phase_sequence = []
 frame_counts = {"head": 0, "chest": 0, "knee": 0, "heel": 0}
 errors = {"head": 1, "chest": 1, "knee": 1, "heel": 1}  # Start with correct form
 threshold = 5  # Threshold for errors in consecutive frames
+last_stance_pred, last_head_pred, last_chest_pred, last_knee_pred, last_heel_pred = 1, 1, 1, 1, 1 # Start with correct form
 
 # Load pre-trained models
 with open('Models/stance_model.pkl', 'rb') as file:
@@ -31,6 +34,8 @@ with open('Models/heel_model.pkl', 'rb') as file:
     heel_model = pickle.load(file)
 with open('Models/knee_model.pkl', 'rb') as file:  # Load knee model
     knee_model = pickle.load(file)
+
+print("Models loaded successfully")
 
 # Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
@@ -79,11 +84,16 @@ def count_reps(phase):
         if current_phase_sequence == expected_phase_sequence:
             rep_count += 1
             current_phase_sequence = []  # Reset for the next rep
+            last_phase = None
 
             # Play the audio feedback based on errors
             error_code = "".join(str(v) for v in errors.values())
             audio_path = "E:\\Pycharm Projects\\Squat Sensei\\Feedback\\" + f"{error_code}.mp3"
-            playsound(audio_path)
+
+            # spawn a new thread to play the audio
+            Thread(target=playsound, args=(audio_path,)).start()
+
+
             reset_error_tracking()  # Reset error tracking for the next rep
 
 
@@ -99,7 +109,7 @@ def extract_landmarks(frame):
 
 # Function to classify based on extracted landmarks
 def classify_pose(landmarks):
-    global frame_counts, errors
+    global frame_counts, errors, last_stance_pred, last_head_pred, last_chest_pred, last_knee_pred, last_heel_pred
 
     # Extract subsets of landmarks based on the training configuration
     stance_landmarks = [landmarks[i] for i in [23, 24, 31, 32]]
@@ -125,23 +135,44 @@ def classify_pose(landmarks):
     heel_df = pd.DataFrame([heel_flat], columns=heel_model.feature_names_in_)
     knee_df = pd.DataFrame([knee_flat], columns=knee_model.feature_names_in_)
 
-    # Make predictions using the loaded models with the corresponding flattened landmarks
-    stance_pred = stance_model.predict(stance_df)[0]
-    phase_pred = phase_model.predict(phase_df)[0]
-    head_pred = head_model.predict(head_df)[0]
-    chest_pred = chest_model.predict(chest_df)[0]
-    knee_pred = knee_model.predict(knee_df)[0]
-    heel_pred = heel_model.predict(heel_df)[0]
+    # Predict the current phase
+    phase_pred = phase_detector(landmarks)  # Or use phase_model if necessary
 
     # Initialize predictions dictionary
-    predictions = {
-        "stance": stance_pred,
-        "phase": phase_detector(landmarks), #"phase": phase_pred,
-        "head": "facing forwards" if head_pred > 0 else "facing downwards",
-        "chest": "chest up" if chest_pred > 0 else "chest down",
-        "knee": "correct position" if knee_pred > 0 else "knees collapsing",
-        "heel": "heels flat" if heel_pred > 0 else "heels raising"
-    }
+    predictions = {"phase": phase_pred}
+
+    # Make predictions based on the current phase and retain previous values when inactive
+    if phase_pred == "top":
+        stance_pred = stance_model.predict(stance_df)[0]
+        head_pred = head_model.predict(head_df)[0]
+        last_stance_pred, last_head_pred = stance_pred, head_pred
+    elif phase_pred == "bottom":
+        head_pred = head_model.predict(head_df)[0]
+        chest_pred = chest_model.predict(chest_df)[0]
+        knee_pred = knee_model.predict(knee_df)[0]
+        heel_pred = heel_model.predict(heel_df)[0]
+        last_head_pred, last_chest_pred, last_knee_pred, last_heel_pred = head_pred, chest_pred, knee_pred, heel_pred
+    elif phase_pred == "middle":
+        chest_pred = chest_model.predict(chest_df)[0]
+        knee_pred = knee_model.predict(knee_df)[0]
+        heel_pred = heel_model.predict(heel_df)[0]
+        last_chest_pred, last_knee_pred, last_heel_pred = chest_pred, knee_pred, heel_pred
+    else:
+        # Retain last valid predictions if classifiers are inactive in this phase
+        stance_pred = last_stance_pred
+        head_pred = last_head_pred
+        chest_pred = last_chest_pred
+        knee_pred = last_knee_pred
+        heel_pred = last_heel_pred
+
+    # Assign predictions with phase-specific classifier values or retained values
+    predictions.update({
+        "stance": last_stance_pred if phase_pred != "top" else stance_pred,
+        "head": "facing forwards" if last_head_pred > 0 else "facing downwards",
+        "chest": "chest up" if last_chest_pred > 0 else "chest down",
+        "knee": "correct position" if last_knee_pred > 0 else "knees collapsing",
+        "heel": "heels flat" if last_heel_pred > 0 else "heels raising"
+    })
 
     # Update error counts based on predictions
     for key in ["head", "chest", "knee", "heel"]:
@@ -156,15 +187,20 @@ def classify_pose(landmarks):
     return predictions
 
 
+
 # Main function to capture video from the camera and classify in real-time
 
 # Main function to capture video from the camera and classify in real-time
-def live_classification(ip_camera_url=0):
-    cap = cv2.VideoCapture(ip_camera_url)
+def live_classification(ip_camera_url):
+    try:
+        cap = cv2.VideoCapture(ip_camera_url)
+    except Exception as e:
+        print("Error opening video source")
+        cap = cv2.VideoCapture(0)
 
     # Set the resolution to 16:9 aspect ratio
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 200)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 200)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -283,7 +319,8 @@ def evaluate_video(video_path):
 
 # Run the live classification
 if __name__ == "__main__":
-    live_classification(ip_camera_url="http://192.168.100.56:8080/video")
+    live_classification(ip_camera_url="http://192.168.100.51:5000/video")
+    # live_classification(ip_camera_url=0)
     # path = r"E:\Pycharm Projects\Squat Sensei\Datasets\Front\compressed\kin"
     # video_files = [f for f in os.listdir(path) if f.endswith('.mp4')]
     # for video_file in video_files:
